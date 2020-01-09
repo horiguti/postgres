@@ -8314,6 +8314,12 @@ CheckRecoveryConsistency(void)
 		 */
 		XLogCheckInvalidPages();
 
+		/*
+		 * Check if the XLOG sequence contained any unresolved references to
+		 * missing directories.
+		 */
+		XLogCheckMissingDirs();
+
 		reachedConsistency = true;
 		ereport(LOG,
 				(errmsg("consistent recovery state reached at %X/%X",
