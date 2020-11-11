@@ -14770,6 +14770,146 @@ AlterTableMoveAll(AlterTableMoveAllStmt *stmt)
 	return new_tablespaceoid;
 }
 
+/*
+ * Alter Table ALL ... SET LOGGED/UNLOGGED
+ *
+ * Allows a user to change persistence of all objects in a given tablespace in
+ * the current database.  Objects can be chosen based on the owner of the
+ * object also, to allow users to change persistene only their objects. The
+ * main permissions handling is done by the lower-level change persistence
+ * function.
+ *
+ * All to-be-modified objects are locked first. If NOWAIT is specified and the
+ * lock can't be acquired then we ereport(ERROR).
+ */
+void
+AlterTableSetLoggedAll(AlterTableSetLoggedAllStmt *stmt)
+{
+	List	   *relations = NIL;
+	ListCell   *l;
+	ScanKeyData key[1];
+	Relation	rel;
+	TableScanDesc scan;
+	HeapTuple	tuple;
+	Oid			tablespaceoid;
+	List	   *role_oids = roleSpecsToIds(stmt->roles);
+
+	/* Ensure we were not asked to change something we can't */
+	if (stmt->objtype != OBJECT_TABLE)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("only tables can be specified")));
+
+	/* Get the tablespace OID */
+	tablespaceoid = get_tablespace_oid(stmt->tablespacename, false);
+
+	/*
+	 * Now that the checks are done, check if we should set either to
+	 * InvalidOid because it is our database's default tablespace.
+	 */
+	if (tablespaceoid == MyDatabaseTableSpace)
+		tablespaceoid = InvalidOid;
+
+	/*
+	 * Walk the list of objects in the tablespace to pick up them. This will
+	 * only find objects in our database, of course.
+	 */
+	ScanKeyInit(&key[0],
+				Anum_pg_class_reltablespace,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(tablespaceoid));
+
+	rel = table_open(RelationRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(rel, 1, key);
+	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_class relForm = (Form_pg_class) GETSTRUCT(tuple);
+		Oid			relOid = relForm->oid;
+
+		/*
+		 * Do not pick-up objects in pg_catalog as part of this, if an admin
+		 * really wishes to do so, they can issue the individual ALTER
+		 * commands directly.
+		 *
+		 * Also, explicitly avoid any shared tables, temp tables, or TOAST
+		 * (TOAST will be changed with the main table).
+		 */
+		if (IsCatalogNamespace(relForm->relnamespace) ||
+			relForm->relisshared ||
+			isAnyTempNamespace(relForm->relnamespace) ||
+			IsToastNamespace(relForm->relnamespace))
+			continue;
+
+		/* Only pick up the object type requested */
+		if (relForm->relkind != RELKIND_RELATION)
+			continue;
+
+		/* Check if we are only picking-up objects owned by certain roles */
+		if (role_oids != NIL && !list_member_oid(role_oids, relForm->relowner))
+			continue;
+
+		/*
+		 * Handle permissions-checking here since we are locking the tables
+		 * and also to avoid doing a bunch of work only to fail part-way. Note
+		 * that permissions will also be checked by AlterTableInternal().
+		 *
+		 * Caller must be considered an owner on the table of which we're going
+		 * to change persistence.
+		 */
+		if (!pg_class_ownercheck(relOid, GetUserId()))
+			aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relOid)),
+						   NameStr(relForm->relname));
+
+		if (stmt->nowait &&
+			!ConditionalLockRelationOid(relOid, AccessExclusiveLock))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("aborting because lock on relation \"%s.%s\" is not available",
+							get_namespace_name(relForm->relnamespace),
+							NameStr(relForm->relname))));
+		else
+			LockRelationOid(relOid, AccessExclusiveLock);
+
+		/*
+		 * Add to our list of objects of which we're going to change
+		 * persistence.
+		 */
+		relations = lappend_oid(relations, relOid);
+	}
+
+	table_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	if (relations == NIL)
+		ereport(NOTICE,
+				(errcode(ERRCODE_NO_DATA_FOUND),
+				 errmsg("no matching relations in tablespace \"%s\" found",
+						tablespaceoid == InvalidOid ? "(database default)" :
+						get_tablespace_name(tablespaceoid))));
+
+	/*
+	 * Everything is locked, loop through and change persistence of all of the
+	 * relations.
+	 */
+	foreach(l, relations)
+	{
+		List	   *cmds = NIL;
+		AlterTableCmd *cmd = makeNode(AlterTableCmd);
+
+		if (stmt->logged)
+			cmd->subtype = AT_SetLogged;
+		else
+			cmd->subtype = AT_SetUnLogged;
+
+		cmds = lappend(cmds, cmd);
+
+		EventTriggerAlterTableStart((Node *) stmt);
+		/* OID is set by AlterTableInternal */
+		AlterTableInternal(lfirst_oid(l), cmds, false);
+		EventTriggerAlterTableEnd();
+	}
+}
+
 static void
 index_copy_data(Relation rel, RelFileNode newrnode)
 {

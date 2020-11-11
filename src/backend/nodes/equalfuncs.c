@@ -1926,6 +1926,18 @@ _equalAlterTableMoveAllStmt(const AlterTableMoveAllStmt *a,
 }
 
 static bool
+_equalAlterTableSetLoggedAllStmt(const AlterTableSetLoggedAllStmt *a,
+								 const AlterTableSetLoggedAllStmt *b)
+{
+	COMPARE_STRING_FIELD(tablespacename);
+	COMPARE_SCALAR_FIELD(objtype);
+	COMPARE_SCALAR_FIELD(logged);
+	COMPARE_SCALAR_FIELD(nowait);
+
+	return true;
+}
+
+static bool
 _equalCreateExtensionStmt(const CreateExtensionStmt *a, const CreateExtensionStmt *b)
 {
 	COMPARE_STRING_FIELD(extname);
@@ -3649,6 +3661,9 @@ equal(const void *a, const void *b)
 			break;
 		case T_AlterTableMoveAllStmt:
 			retval = _equalAlterTableMoveAllStmt(a, b);
+			break;
+		case T_AlterTableSetLoggedAllStmt:
+			retval = _equalAlterTableSetLoggedAllStmt(a, b);
 			break;
 		case T_CreateExtensionStmt:
 			retval = _equalCreateExtensionStmt(a, b);
