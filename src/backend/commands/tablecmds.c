@@ -53,6 +53,7 @@
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/policy.h"
+#include "commands/progress.h"
 #include "commands/sequence.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
@@ -5348,6 +5349,187 @@ ATParseTransformCmd(List **wqueue, AlteredTableInfo *tab, Relation rel,
 }
 
 /*
+ * RelationChangePersistence: do in-place persistence change of a relation
+ */
+static void
+RelationChangePersistence(AlteredTableInfo *tab, char persistence,
+						  LOCKMODE lockmode)
+{
+	Relation 	rel;
+	Relation	classRel;
+	HeapTuple	tuple,
+				newtuple;
+	Datum		new_val[Natts_pg_class];
+	bool		new_null[Natts_pg_class],
+				new_repl[Natts_pg_class];
+	int			i;
+	List	   *relids;
+	ListCell   *lc_oid;
+
+	Assert(tab->rewrite == AT_REWRITE_ALTER_PERSISTENCE);
+	Assert(lockmode == AccessExclusiveLock);
+
+	/*
+	 * Under the following condition, we need to call ATRewriteTable, which
+	 * cannot be false in the AT_REWRITE_ALTER_PERSISTENCE case.
+	 */
+	Assert(tab->constraints == NULL && tab->partition_constraint == NULL &&
+		   tab->newvals == NULL && !tab->verify_new_notnull);
+
+	rel = table_open(tab->relid, lockmode);
+
+	Assert(rel->rd_rel->relpersistence != persistence);
+
+	elog(DEBUG1, "perform in-place persistnce change");
+
+	/*
+	 * First we collect all relations that we need to change persistence.
+	 */
+
+	/* Collect OIDs of indexes and toast relations */
+	relids = RelationGetIndexList(rel);
+	relids = lcons_oid(rel->rd_id, relids);
+
+	/* Add toast relation if any */
+	if (OidIsValid(rel->rd_rel->reltoastrelid))
+	{
+		List	*toastidx;
+		Relation toastrel = table_open(rel->rd_rel->reltoastrelid, lockmode);
+
+		relids = lappend_oid(relids, rel->rd_rel->reltoastrelid);
+		toastidx = RelationGetIndexList(toastrel);
+		relids = list_concat(relids, toastidx);
+		pfree(toastidx);
+		table_close(toastrel, NoLock);
+	}
+
+	table_close(rel, NoLock);
+
+	/* Make changes in storage */
+	classRel = table_open(RelationRelationId, RowExclusiveLock);
+
+	foreach (lc_oid, relids)
+	{
+		Oid reloid = lfirst_oid(lc_oid);
+		Relation r = relation_open(reloid, lockmode);
+
+		/*
+		 * XXXX: Some access methods do not bear up an in-place persistence
+		 * change. Specifically, GiST uses page LSNs to figure out whether a
+		 * block has changed, where UNLOGGED GiST indexes use fake LSNs that
+		 * are incompatible with real LSNs used for LOGGED ones.
+		 *
+		 * Maybe if gistGetFakeLSN behaved the same way for permanent and
+		 * unlogged indexes, we could skip index rebuild in exchange of some
+		 * extra WAL records emitted while it is unlogged.
+		 *
+		 * Check relam against a positive list so that we take this way for
+		 * unknown AMs.
+		 */
+		if (r->rd_rel->relkind == RELKIND_INDEX &&
+			/* GiST is excluded */
+			r->rd_rel->relam != BTREE_AM_OID &&
+			r->rd_rel->relam != HASH_AM_OID &&
+			r->rd_rel->relam != GIN_AM_OID &&
+			r->rd_rel->relam != SPGIST_AM_OID &&
+			r->rd_rel->relam != BRIN_AM_OID)
+		{
+			int			reindex_flags;
+			ReindexParams params = {0};
+
+			/* reindex doesn't allow concurrent use of the index */
+			table_close(r, NoLock);
+
+			reindex_flags =
+				REINDEX_REL_SUPPRESS_INDEX_USE |
+				REINDEX_REL_CHECK_CONSTRAINTS;
+
+			/* Set the same persistence with the parent relation. */
+			if (persistence == RELPERSISTENCE_UNLOGGED)
+				reindex_flags |= REINDEX_REL_FORCE_INDEXES_UNLOGGED;
+			else
+				reindex_flags |= REINDEX_REL_FORCE_INDEXES_PERMANENT;
+
+			reindex_index(reloid, reindex_flags, persistence, &params);
+
+			continue;
+		}
+
+		/* Create or drop init fork */
+		if (persistence == RELPERSISTENCE_UNLOGGED)
+			RelationCreateInitFork(r);
+		else
+			RelationDropInitFork(r);
+
+		/*
+		 * When this relation gets WAL-logged, immediately sync all files but
+		 * initfork to establish the initial state on storage.  Buffers have
+		 * already flushed out by RelationCreate(Drop)InitFork called just
+		 * above. Initfork should have been synced as needed.
+		 */
+		if (persistence == RELPERSISTENCE_PERMANENT)
+		{
+			for (i = 0 ; i < INIT_FORKNUM ; i++)
+			{
+				if (smgrexists(RelationGetSmgr(r), i))
+					smgrimmedsync(RelationGetSmgr(r), i);
+			}
+		}
+
+		/* Update catalog */
+		tuple = SearchSysCacheCopy1(RELOID,	ObjectIdGetDatum(reloid));
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "cache lookup failed for relation %u", reloid);
+
+		memset(new_val, 0, sizeof(new_val));
+		memset(new_null, false, sizeof(new_null));
+		memset(new_repl, false, sizeof(new_repl));
+
+		new_val[Anum_pg_class_relpersistence - 1] = CharGetDatum(persistence);
+		new_null[Anum_pg_class_relpersistence - 1] = false;
+		new_repl[Anum_pg_class_relpersistence - 1] = true;
+
+		newtuple = heap_modify_tuple(tuple, RelationGetDescr(classRel),
+									 new_val, new_null, new_repl);
+
+		CatalogTupleUpdate(classRel, &newtuple->t_self, newtuple);
+		heap_freetuple(newtuple);
+
+		/*
+		 * While wal_level >= replica, switching to LOGGED requires the
+		 * relation content to be WAL-logged to recover the table.
+		 * We don't emit this fhile wal_level = minimal.
+		 */
+		if (persistence == RELPERSISTENCE_PERMANENT && XLogIsNeeded())
+		{
+			ForkNumber fork;
+			xl_smgr_truncate xlrec;
+
+			xlrec.blkno = 0;
+			xlrec.rnode = r->rd_node;
+			xlrec.flags = SMGR_TRUNCATE_ALL;
+
+			XLogBeginInsert();
+			XLogRegisterData((char *) &xlrec, sizeof(xlrec));
+
+			XLogInsert(RM_SMGR_ID, XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
+
+			for (fork = 0; fork < INIT_FORKNUM ; fork++)
+			{
+				if (smgrexists(RelationGetSmgr(r), fork))
+					log_newpage_range(r, fork, 0,
+									  smgrnblocks(RelationGetSmgr(r), fork),
+									  false);
+			}
+		}
+
+		table_close(r, NoLock);
+	}
+
+	table_close(classRel, NoLock);
+}
+
+/*
  * ATRewriteTables: ALTER TABLE phase 3
  */
 static void
@@ -5477,47 +5659,55 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 										 tab->relid,
 										 tab->rewrite);
 
-			/*
-			 * Create transient table that will receive the modified data.
-			 *
-			 * Ensure it is marked correctly as logged or unlogged.  We have
-			 * to do this here so that buffers for the new relfilenode will
-			 * have the right persistence set, and at the same time ensure
-			 * that the original filenode's buffers will get read in with the
-			 * correct setting (i.e. the original one).  Otherwise a rollback
-			 * after the rewrite would possibly result with buffers for the
-			 * original filenode having the wrong persistence setting.
-			 *
-			 * NB: This relies on swap_relation_files() also swapping the
-			 * persistence. That wouldn't work for pg_class, but that can't be
-			 * unlogged anyway.
-			 */
-			OIDNewHeap = make_new_heap(tab->relid, NewTableSpace, NewAccessMethod,
-									   persistence, lockmode);
+			if (tab->rewrite == AT_REWRITE_ALTER_PERSISTENCE)
+				RelationChangePersistence(tab, persistence, lockmode);
+			else
+			{
+				/*
+				 * Create transient table that will receive the modified data.
+				 *
+				 * Ensure it is marked correctly as logged or unlogged.  We
+				 * have to do this here so that buffers for the new relfilenode
+				 * will have the right persistence set, and at the same time
+				 * ensure that the original filenode's buffers will get read in
+				 * with the correct setting (i.e. the original one).  Otherwise
+				 * a rollback after the rewrite would possibly result with
+				 * buffers for the original filenode having the wrong
+				 * persistence setting.
+				 *
+				 * NB: This relies on swap_relation_files() also swapping the
+				 * persistence. That wouldn't work for pg_class, but that can't
+				 * be unlogged anyway.
+				 */
+				OIDNewHeap = make_new_heap(tab->relid, NewTableSpace,
+										   NewAccessMethod,
+										   persistence, lockmode);
 
-			/*
-			 * Copy the heap data into the new table with the desired
-			 * modifications, and test the current data within the table
-			 * against new constraints generated by ALTER TABLE commands.
-			 */
-			ATRewriteTable(tab, OIDNewHeap, lockmode);
+				/*
+				 * Copy the heap data into the new table with the desired
+				 * modifications, and test the current data within the table
+				 * against new constraints generated by ALTER TABLE commands.
+				 */
+				ATRewriteTable(tab, OIDNewHeap, lockmode);
 
-			/*
-			 * Swap the physical files of the old and new heaps, then rebuild
-			 * indexes and discard the old heap.  We can use RecentXmin for
-			 * the table's new relfrozenxid because we rewrote all the tuples
-			 * in ATRewriteTable, so no older Xid remains in the table.  Also,
-			 * we never try to swap toast tables by content, since we have no
-			 * interest in letting this code work on system catalogs.
-			 */
-			finish_heap_swap(tab->relid, OIDNewHeap,
-							 false, false, true,
-							 !OidIsValid(tab->newTableSpace),
-							 RecentXmin,
-							 ReadNextMultiXactId(),
-							 persistence);
+				/*
+				 * Swap the physical files of the old and new heaps, then
+				 * rebuild indexes and discard the old heap.  We can use
+				 * RecentXmin for the table's new relfrozenxid because we
+				 * rewrote all the tuples in ATRewriteTable, so no older Xid
+				 * remains in the table.  Also, we never try to swap toast
+				 * tables by content, since we have no interest in letting this
+				 * code work on system catalogs.
+				 */
+				finish_heap_swap(tab->relid, OIDNewHeap,
+								 false, false, true,
+								 !OidIsValid(tab->newTableSpace),
+								 RecentXmin,
+								 ReadNextMultiXactId(),
+								 persistence);
 
-			InvokeObjectPostAlterHook(RelationRelationId, tab->relid, 0);
+				InvokeObjectPostAlterHook(RelationRelationId, tab->relid, 0);
+			}
 		}
 		else
 		{
