@@ -2,8 +2,9 @@
 use strict;
 use warnings;
 use PostgresNode;
+use Time::HiRes qw(usleep);
 use TestLib;
-use Test::More tests => 36;
+use Test::More tests => 37;
 
 # Initialize primary node
 my $node_primary = get_new_node('primary');
@@ -409,3 +410,41 @@ ok( ($phys_restart_lsn_pre cmp $phys_restart_lsn_post) == 0,
 my $primary_data = $node_primary->data_dir;
 ok(!-f "$primary_data/pg_wal/$segment_removed",
 	"WAL segment $segment_removed recycled after physical slot advancing");
+
+#
+# Check if timeline-increment works while reading a historic timeline.
+my $node_primary_2 = get_new_node('primary_2');
+$node_primary_2->init(allows_streaming => 1);
+$node_primary_2->enable_archiving; # needed to make .paritial segment
+$node_primary_2->start;
+$node_primary_2->backup($backup_name);
+my $node_standby_3 = get_new_node('standby_3');
+$node_standby_3->init_from_backup($node_primary_2, $backup_name,
+								  has_streaming => 1);
+$node_primary_2->stop;
+$node_primary_2->set_standby_mode; # increment primary timeline
+$node_primary_2->start;
+$node_primary_2->promote;
+my $logstart = $node_standby_3->current_log_position();
+$node_standby_3->start;
+
+my $success = 0;
+for (my $i = 0 ; $i < 1000; $i++)
+{
+	if ($node_standby_3->find_in_log(
+			"requested WAL segment [0-9A-F]+ has already been removed",
+			$logstart))
+	{
+		last;
+	}
+	elsif ($node_standby_3->find_in_log(
+			"End of WAL reached on timeline",
+			   $logstart))
+	{
+		$success = 1;
+		last;
+	}
+	usleep(100_000);
+}
+
+ok($success, 'Timeline increment while reading a historic timeline');
