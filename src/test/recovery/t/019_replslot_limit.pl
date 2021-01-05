@@ -165,19 +165,17 @@ $node_primary->wait_for_catchup($node_standby, 'replay', $start_lsn);
 
 $node_standby->stop;
 
-ok( !find_in_log(
-		$node_standby,
-		"requested WAL segment [0-9A-F]+ has already been removed"),
+ok( !$node_standby->find_in_log(
+		 "requested WAL segment [0-9A-F]+ has already been removed"),
 	'check that required WAL segments are still available');
 
 # Advance WAL again, the slot loses the oldest segment.
-my $logstart = get_log_size($node_primary);
+my $logstart = $node_primary->current_log_position();
 advance_wal($node_primary, 7);
 $node_primary->safe_psql('postgres', "CHECKPOINT;");
 
 # WARNING should be issued
-ok( find_in_log(
-		$node_primary,
+ok( $node_primary->find_in_log(
 		"invalidating slot \"rep1\" because its restart_lsn [0-9A-F/]+ exceeds max_slot_wal_keep_size",
 		$logstart),
 	'check that the warning is logged');
@@ -190,14 +188,13 @@ is($result, "rep1|f|t|lost|",
 	'check that the slot became inactive and the state "lost" persists');
 
 # The standby no longer can connect to the primary
-$logstart = get_log_size($node_standby);
+$logstart = $node_standby->current_log_position();
 $node_standby->start;
 
 my $failed = 0;
 for (my $i = 0; $i < 10000; $i++)
 {
-	if (find_in_log(
-			$node_standby,
+	if ($node_standby->find_in_log(
 			"requested WAL segment [0-9A-F]+ has already been removed",
 			$logstart))
 	{
@@ -263,26 +260,4 @@ sub advance_wal
 			"CREATE TABLE t (); DROP TABLE t; SELECT pg_switch_wal();");
 	}
 	return;
-}
-
-# return the size of logfile of $node in bytes
-sub get_log_size
-{
-	my ($node) = @_;
-
-	return (stat $node->logfile)[7];
-}
-
-# find $pat in logfile of $node after $off-th byte
-sub find_in_log
-{
-	my ($node, $pat, $off) = @_;
-
-	$off = 0 unless defined $off;
-	my $log = TestLib::slurp_file($node->logfile);
-	return 0 if (length($log) <= $off);
-
-	$log = substr($log, $off);
-
-	return $log =~ m/$pat/;
 }

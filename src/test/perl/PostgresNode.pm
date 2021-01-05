@@ -2223,6 +2223,39 @@ sub pg_recvlogical_upto
 
 =pod
 
+=item $node->current_log_position()
+
+Return the current position of server log.
+
+=cut
+
+sub current_log_position
+{
+	my $self = shift;
+
+	return (stat $self->logfile)[7];
+}
+
+=pod
+
+=item $node->find_in_log($pattern, $startpos)
+
+Returns whether the $pattern occurs after $startpos in the server log.
+
+=cut
+
+sub find_in_log
+{
+	my ($self, $pattern, $startpos) = @_;
+
+	$startpos = 0 unless defined $startpos;
+	my $log = TestLib::slurp_file($self->logfile, $startpos);
+
+	return $log =~ m/$pattern/;
+}
+
+=pod
+
 =back
 
 =cut

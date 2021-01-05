@@ -430,30 +430,38 @@ sub slurp_dir
 
 =pod
 
-=item slurp_file(filename)
+=item slurp_file(filename, pos)
 
-Return the full contents of the specified file.
+Return the contents after pos of the specified file.
+Reutrns the full contents if pos is omitted.
 
 =cut
 
 sub slurp_file
 {
-	my ($filename) = @_;
+	my ($filename, $from) = @_;
 	local $/;
 	my $contents;
+
+	$from = 0 unless defined $from;
+
 	if ($Config{osname} ne 'MSWin32')
 	{
 		open(my $in, '<', $filename)
 		  or croak "could not read \"$filename\": $!";
+		seek($in, $from, 0)
+		  or croak "could not seek \"$filename\" to $from: $!";
 		$contents = <$in>;
 		close $in;
 	}
 	else
 	{
 		my $fHandle = createFile($filename, "r", "rwd")
-		  or croak "could not open \"$filename\": $^E";
+		  or croak "could not open oshandle \"$filename\": $^E\n";
 		OsFHandleOpen(my $fh = IO::Handle->new(), $fHandle, 'r')
-		  or croak "could not read \"$filename\": $^E\n";
+		  or croak "could not open \"$filename\": $^E\n";
+		seek($fh, $from, 0)
+		  or croak "could not seek \"$filename\" to $from: $^E\n";
 		$contents = <$fh>;
 		CloseHandle($fHandle)
 		  or croak "could not close \"$filename\": $^E\n";
