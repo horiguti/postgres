@@ -4,7 +4,7 @@ task:
     image: cirrusci/windowsservercore:cmake
   install_script:
     - reg.exe add "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Internet Explorer\Main" /v DisableFirstRunCustomize /t REG_DWORD /d 1 /f
-	- reg.exe query "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Internet Explorer\Main"
+    - reg.exe query "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Internet Explorer\Main"
     - choco install -y winflexbison activeperl diffutils
     - rename c:\ProgramData\chocolatey\bin\win_flex.exe flex.exe
     - rename c:\ProgramData\chocolatey\bin\win_bison.exe bison.exe
