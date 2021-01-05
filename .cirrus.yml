@@ -3,6 +3,8 @@ task:
   windows_container:
     image: cirrusci/windowsservercore:cmake
   install_script:
+    - choco -h
+    - choco -v
     - choco install -y winflexbison activeperl diffutils
     - rename c:\ProgramData\chocolatey\bin\win_flex.exe flex.exe
     - rename c:\ProgramData\chocolatey\bin\win_bison.exe bison.exe
